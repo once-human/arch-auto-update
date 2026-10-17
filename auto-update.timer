@@ -1,0 +1,14 @@
+[Unit]
+Description=Hourly check for safe automatic Arch updates
+
+[Timer]
+# Checks are cheap; the script only actually upgrades once every
+# MIN_INTERVAL_HOURS (default 24). Hourly checks mean a laptop that's
+# often asleep or off still gets updated about once a day.
+OnBootSec=10min
+OnCalendar=hourly
+RandomizedDelaySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

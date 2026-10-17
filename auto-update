@@ -1,0 +1,453 @@
+#!/usr/bin/env bash
+# auto-update — safe, quiet automatic updates for Arch Linux.
+#
+#   sudo auto-update run       upgrade now (ignores the 24h interval)
+#   auto-update status         what happened last, what needs you
+#   auto-update log            recent log
+#   sudo auto-update ack       "I've read the Arch news" → resume auto-updates
+#   sudo auto-update pause     stop automatic upgrades until resumed
+#   sudo auto-update resume    undo pause
+#
+# Run by auto-update.timer as: auto-update run --scheduled
+
+set -uo pipefail
+
+CONF=/etc/auto-update.conf
+STATE_DIR=/var/lib/auto-update
+LOG=/var/log/auto-update.log
+LOCK=/run/auto-update.lock
+NEWS_URL="https://archlinux.org/feeds/news/"
+
+# ---- defaults (overridden by $CONF) ---------------------------------------
+NOTIFY_USER=""
+MIN_INTERVAL_HOURS=24
+HOLD_PKGS="hyprland hyprland-* aquamarine hyprutils hyprlang quickshell* nvidia nvidia-* grub"
+CHECK_ARCH_NEWS=1
+SNAPSHOT_BEFORE=1
+UPDATE_FLATPAK=1
+MIN_FREE_MB=3072
+SHOW_PROGRESS=1
+# shellcheck source=/dev/null
+[[ -r $CONF ]] && . "$CONF"
+
+# ---- helpers ---------------------------------------------------------------
+log() {
+    local msg="[$(date '+%F %T')] $*"
+    echo "$msg"
+    [[ $EUID -eq 0 ]] && echo "$msg" >>"$LOG"
+}
+
+set_state() { echo "$2" >"$STATE_DIR/$1"; }
+get_state() { cat "$STATE_DIR/$1" 2>/dev/null || true; }
+
+# Desktop notification to the configured user's graphical session.
+notify() {
+    local urgency=$1 title=$2 body uid
+    body=$(printf '%b' "$3")
+    [[ -n $NOTIFY_USER ]] || return 0
+    command -v notify-send >/dev/null || return 0
+    uid=$(id -u "$NOTIFY_USER" 2>/dev/null) || return 0
+    [[ -S /run/user/$uid/bus ]] || return 0
+    runuser -u "$NOTIFY_USER" -- env \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+        notify-send -a "Auto Update" -u "$urgency" -i system-software-update \
+        "$title" "$body" >/dev/null 2>&1 || true
+}
+
+# Run a command as the desktop user, inside their session bus.
+as_user() {
+    local uid
+    [[ -n $NOTIFY_USER ]] || return 1
+    uid=$(id -u "$NOTIFY_USER" 2>/dev/null) || return 1
+    [[ -S /run/user/$uid/bus ]] || return 1
+    runuser -u "$NOTIFY_USER" -- env DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" "$@"
+}
+
+# One live notification that keeps replacing itself (start → progress → done).
+# progress TITLE BODY [PERCENT] [URGENCY] [TIMEOUT_MS]
+PROG_ID=""
+PROG_LAST=0
+progress() {
+    local title=$1 body=$2 pct=${3:-} urg=${4:-low} timeout=${5:-}
+    set_state progress "$title — $body"
+    [[ $SHOW_PROGRESS == 1 ]] || return 0
+    command -v notify-send >/dev/null || return 0
+    local args=(-a "System Update" -u "$urg" -i system-software-update -p
+        -h string:x-canonical-private-synchronous:auto-update
+        -h string:x-dunst-stack-tag:auto-update)
+    [[ -n $pct ]] && args+=(-h "int:value:$pct")
+    [[ -n $PROG_ID ]] && args+=(-r "$PROG_ID")
+    [[ -n $timeout ]] && args+=(-t "$timeout")
+    local id
+    id=$(as_user notify-send "${args[@]}" "$title" "$(printf '%b' "$body")" 2>/dev/null) && PROG_ID=${id//[!0-9]/}
+    PROG_LAST=$SECONDS
+}
+
+# Same, but rate-limited so a fast install doesn't spam the daemon.
+progress_tick() { ((SECONDS - PROG_LAST >= 2)) && progress "$@"; return 0; }
+
+bar() { # bar PERCENT → ▰▰▰▱▱▱▱▱▱▱
+    local p=$1 n i out=""
+    n=$((p / 10))
+    for ((i = 0; i < 10; i++)); do ((i < n)) && out+="▰" || out+="▱"; done
+    printf '%s' "$out"
+}
+
+human_size() { numfmt --to=iec --suffix=B --format='%.1f' "${1:-0}" 2>/dev/null || echo "${1}B"; }
+
+# Notify only once per distinct message (so held packages don't nag hourly).
+notify_once() {
+    local key=$1 urgency=$2 title=$3 body=$4
+    local sig
+    sig=$(printf '%s|%s' "$title" "$body" | md5sum | cut -d' ' -f1)
+    [[ $(get_state "notified-$key") == "$sig" ]] && return 0
+    set_state "notified-$key" "$sig"
+    notify "$urgency" "$title" "$body"
+}
+
+need_root() {
+    if [[ $EUID -ne 0 ]]; then
+        echo "This needs root: sudo auto-update $*" >&2
+        exit 1
+    fi
+}
+
+# Newest Arch news item → "epoch<TAB>title". Empty on failure.
+latest_news() {
+    local xml item title pub epoch
+    xml=$(curl -fsS -m 25 --retry 2 "$NEWS_URL" 2>/dev/null) || return 1
+    item=$(printf '%s' "$xml" | tr '\n' ' ' | grep -o '<item>.*' | sed 's#</item>.*##')
+    [[ -n $item ]] || return 1
+    title=$(printf '%s' "$item" | sed -n 's#.*<title>\([^<]*\)</title>.*#\1#p' |
+        sed 's/&gt;/>/g; s/&lt;/</g; s/&amp;/\&/g; s/&quot;/"/g; s/&#39;/'"'"'/g')
+    pub=$(printf '%s' "$item" | sed -n 's#.*<pubDate>\([^<]*\)</pubDate>.*#\1#p')
+    epoch=$(date -d "$pub" +%s 2>/dev/null) || return 1
+    printf '%s\t%s\n' "$epoch" "$title"
+}
+
+# Like checkupdates, without needing pacman-contrib: sync into a throwaway
+# db so the real one never ends up synced-but-not-upgraded.
+# Prints "name old -> new" lines. rc 0 = updates, 2 = none, 1 = error.
+pending_updates() {
+    local tmpdb out err
+    tmpdb=$(mktemp -d /var/tmp/auto-update-db.XXXXXX) || return 1
+    # pacman 7 downloads as the unprivileged 'alpm' user, so it must be able
+    # to enter this directory (mktemp makes it root-only by default).
+    chmod 755 "$tmpdb"
+    ln -s /var/lib/pacman/local "$tmpdb/local"
+    if ! err=$(LC_ALL=C pacman -Sy --dbpath "$tmpdb" --logfile /dev/null --noprogressbar 2>&1 >/dev/null); then
+        echo "temp-db sync failed: $err" >&2
+        # Fallback: same sync without the download sandbox.
+        if ! err=$(LC_ALL=C pacman -Sy --disable-sandbox --dbpath "$tmpdb" --logfile /dev/null --noprogressbar 2>&1 >/dev/null); then
+            echo "temp-db sync failed again: $err" >&2
+            set_state last-error "$(echo "$err" | tail -n 2 | tr '\n' ' ')"
+            rm -rf "$tmpdb"
+            return 1
+        fi
+    fi
+    out=$(LC_ALL=C pacman -Qu --dbpath "$tmpdb" 2>/dev/null | grep -v '\[ignored\]')
+    # Total download size (for the notification). Missing = cached.
+    LC_ALL=C pacman -Sup --dbpath "$tmpdb" --print-format '%s' 2>/dev/null |
+        awk '/^[0-9]+$/ {t += $1} END {print t + 0}' >"$STATE_DIR/pending-bytes"
+    rm -rf "$tmpdb"
+    rm -f "$STATE_DIR/last-error"
+    [[ -n $out ]] || return 2
+    printf '%s\n' "$out"
+}
+
+# Download phase: parse pacman output, update the live notification.
+phase_download() {
+    local total=$1 done_n=0 line pct
+    shopt -s lastpipe
+    systemd-inhibit --what=sleep:idle:handle-lid-switch --who=auto-update --why="Downloading updates" --mode=block \
+        env LC_ALL=C stdbuf -oL pacman -Suw --needed --noconfirm --noprogressbar pacman-contrib 2>&1 |
+        while IFS= read -r line; do
+            echo "$line" >>"$LOG"
+            if [[ $line == *" downloading..."* && $line != *.sig* && $line != *.db* ]]; then
+                ((done_n < total)) && ((done_n++))
+                pct=$((total ? done_n * 100 / total : 100))
+                progress_tick "Downloading updates · $pct%" "$(bar "$pct")  $done_n of $total packages" "$pct"
+            fi
+        done
+    return "${PIPESTATUS[0]}"
+}
+
+# Install phase: "(12/88) upgrading firefox" lines → progress.
+phase_install() {
+    local total=$1 line i n pkg pct hooks=0
+    shopt -s lastpipe
+    systemd-inhibit --what=shutdown:sleep:idle:handle-lid-switch --who=auto-update --why="Installing system updates" --mode=block \
+        env LC_ALL=C stdbuf -oL pacman -Su --needed --noconfirm --noprogressbar pacman-contrib 2>&1 |
+        while IFS= read -r line; do
+            echo "$line" >>"$LOG"
+            if [[ $line == *"Running post-transaction hooks"* ]]; then
+                hooks=1
+                progress "Finishing up · 95%" "$(bar 95)  Running post-install steps (initramfs, caches…)" 95
+            elif [[ $hooks == 0 && $line =~ ^\(\ *([0-9]+)/\ *([0-9]+)\)\ (upgrading|installing|reinstalling|downgrading)\ (.+)$ ]]; then
+                i=${BASH_REMATCH[1]} n=${BASH_REMATCH[2]} pkg=${BASH_REMATCH[4]}
+                pkg=${pkg%...}
+                pct=$((i * 90 / n))
+                progress_tick "Installing updates · $pct%" "$(bar "$pct")  $i of $n · $pkg" "$pct"
+            fi
+        done
+    return "${PIPESTATUS[0]}"
+}
+
+take_snapshot() {
+    [[ $SNAPSHOT_BEFORE == 1 ]] || return 0
+    if pacman -Qq snap-pac >/dev/null 2>&1; then
+        log "snapshot: snap-pac will take pre/post snapshots automatically"
+    elif command -v timeshift >/dev/null; then
+        if pacman -Qq timeshift-autosnap >/dev/null 2>&1; then
+            log "snapshot: timeshift-autosnap will snapshot automatically"
+        else
+            log "snapshot: creating Timeshift snapshot"
+            timeshift --create --scripted --comments "auto-update pre" --tags D >>"$LOG" 2>&1 ||
+                log "snapshot: Timeshift snapshot FAILED (continuing)"
+        fi
+    elif command -v snapper >/dev/null && snapper -c root list >/dev/null 2>&1; then
+        log "snapshot: creating Snapper snapshot"
+        snapper -c root create -c number -d "auto-update pre" >>"$LOG" 2>&1 ||
+            log "snapshot: Snapper snapshot FAILED (continuing)"
+    else
+        log "snapshot: no snapshot tool found (skipped)"
+    fi
+}
+
+update_flatpak() {
+    [[ $UPDATE_FLATPAK == 1 ]] && command -v flatpak >/dev/null || return 0
+    log "flatpak: updating system apps"
+    progress "Updating Flatpak apps" "Almost done…" 98
+    flatpak update -y --noninteractive --system >>"$LOG" 2>&1 || log "flatpak: system update failed"
+    if [[ -n $NOTIFY_USER ]]; then
+        local uid
+        uid=$(id -u "$NOTIFY_USER" 2>/dev/null) || return 0
+        if [[ -d /home/$NOTIFY_USER/.local/share/flatpak ]] || runuser -u "$NOTIFY_USER" -- flatpak --user list 2>/dev/null | grep -q .; then
+            log "flatpak: updating $NOTIFY_USER's apps"
+            runuser -u "$NOTIFY_USER" -- env XDG_RUNTIME_DIR="/run/user/$uid" \
+                flatpak update -y --noninteractive --user >>"$LOG" 2>&1 || log "flatpak: user update failed"
+        fi
+    fi
+}
+
+# ---- the actual run --------------------------------------------------------
+cmd_run() {
+    local scheduled=0
+    [[ ${1:-} == --scheduled ]] && scheduled=1
+    need_root run
+    mkdir -p "$STATE_DIR"
+    touch "$LOG"
+
+    exec 9>"$LOCK"
+    flock -n 9 || { echo "Another auto-update run is in progress."; exit 0; }
+
+    local now last
+    now=$(date +%s)
+
+    if [[ $scheduled == 1 ]]; then
+        [[ -f $STATE_DIR/paused ]] && exit 0
+        last=$(get_state last-success)
+        if [[ -n $last ]] && ((now - last < MIN_INTERVAL_HOURS * 3600)); then
+            exit 0 # not due yet — stay completely silent
+        fi
+        # After a failed upgrade, back off a few hours instead of retrying hourly.
+        last=$(get_state last-failure)
+        if [[ -n $last ]] && ((now - last < 6 * 3600)); then
+            exit 0
+        fi
+    fi
+
+    log "==== auto-update run (scheduled=$scheduled) ===="
+    set_state last-attempt "$now"
+
+    # 1. Don't fight a pacman you're running yourself.
+    if [[ -e /var/lib/pacman/db.lck ]]; then
+        if pgrep -x pacman >/dev/null || pgrep -x yay >/dev/null || pgrep -x paru >/dev/null; then
+            log "pacman is busy (you're probably updating manually) — skipping"
+            set_state last-result "skipped: pacman busy"
+            exit 0
+        fi
+        log "stale pacman lock found and no package manager running — skipping to be safe"
+        set_state last-result "needs you: stale /var/lib/pacman/db.lck"
+        notify_once lock normal "Auto-update paused" \
+            "A stale pacman lock exists. If nothing is updating, remove it: sudo rm /var/lib/pacman/db.lck"
+        exit 0
+    fi
+
+    # 2. Disk space.
+    local free_mb
+    free_mb=$(df -Pm / | awk 'NR==2 {print $4}')
+    if ((free_mb < MIN_FREE_MB)); then
+        log "only ${free_mb}MB free on / — skipping"
+        set_state last-result "needs you: low disk space (${free_mb}MB)"
+        notify_once disk normal "Auto-update skipped" "Only ${free_mb} MB free on /. Try: sudo paccache -rk1"
+        exit 0
+    fi
+
+    # 3. Arch news gate (manual interventions are announced here).
+    if [[ $CHECK_ARCH_NEWS == 1 ]]; then
+        local news epoch title acked
+        if ! news=$(latest_news) || [[ -z $news ]]; then
+            log "couldn't reach archlinux.org news — will retry later"
+            set_state last-result "skipped: offline / news unreachable"
+            exit 0
+        fi
+        epoch=${news%%$'\t'*}
+        title=${news#*$'\t'}
+        acked=$(get_state news-acked)
+        if [[ -z $acked ]]; then
+            set_state news-acked "$epoch" # first run: accept current news
+        elif ((epoch > acked)); then
+            log "new Arch news: \"$title\" — pausing until acknowledged"
+            set_state news-pending "$title"
+            set_state last-result "needs you: new Arch news"
+            notify_once news critical "Arch news — auto-updates paused" \
+                "\"$title\"\nRead https://archlinux.org/news/ then run: sudo auto-update ack"
+            exit 0
+        fi
+    fi
+
+    # 4. What's pending? (synced into a temp db → never a partial upgrade)
+    local pending rc
+    pending=$(pending_updates 2>>"$LOG")
+    rc=$?
+    if [[ $rc -eq 2 ]]; then
+        log "system is up to date"
+        set_state last-success "$now"
+        set_state last-result "ok: already up to date"
+        update_flatpak
+        exit 0
+    elif [[ $rc -ne 0 ]]; then
+        log "update check failed (rc=$rc) — will retry next hour"
+        set_state last-result "skipped: couldn't check for updates (see last error)"
+        exit 0
+    fi
+
+    local count names
+    count=$(printf '%s\n' "$pending" | grep -c .)
+    names=$(printf '%s\n' "$pending" | awk '{print $1}')
+    log "$count package(s) pending"
+
+    # 5. Held packages → skip the whole upgrade (no partial upgrades, ever).
+    local held=() pkg pat
+    # shellcheck disable=SC2086
+    while read -r pkg; do
+        for pat in $HOLD_PKGS; do
+            # shellcheck disable=SC2053
+            [[ $pkg == $pat ]] && { held+=("$pkg"); break; }
+        done
+    done <<<"$names"
+    if ((${#held[@]})); then
+        log "held package(s) in this update: ${held[*]} — not upgrading automatically"
+        set_state last-result "needs you: held package(s) ${held[*]}"
+        notify_once held normal "Update needs you" \
+            "${held[*]} has an update, so auto-update is waiting.\nRun: sudo pacman -Syu"
+        exit 0
+    fi
+
+    # 6. Snapshot, then upgrade — inhibiting sleep/shutdown so it can't be cut off.
+    take_snapshot
+    local stamp
+    stamp=$(mktemp)
+    local running_kernel_dir="/usr/lib/modules/$(uname -r)"
+
+    local bytes size_txt started=$SECONDS
+    bytes=$(get_state pending-bytes)
+    size_txt=$(human_size "$bytes")
+    log "upgrading: $(echo $names)"
+    progress "Updating your system" "$count packages · $size_txt to download\nRunning in the background — keep working." 0 normal
+
+    fail() {
+        log "pacman FAILED in $1 phase (rc=$2) — see $LOG"
+        set_state last-result "FAILED during $1 (pacman exit $2) — see: auto-update log"
+        set_state last-failure "$now"
+        rm -f "$STATE_DIR/progress" "$stamp"
+        progress "Update failed" "Nothing was broken — pacman stopped during $1.\nRun: sudo pacman -Syu   (details: auto-update log)" "" critical 0
+        exit 1
+    }
+
+    # a) keyring first (avoids signature errors on big updates)
+    LC_ALL=C pacman -Sy --needed --noconfirm --noprogressbar archlinux-keyring >>"$LOG" 2>&1 || fail "sync" $?
+    # b) download everything (safe to interrupt — nothing is installed yet)
+    phase_download "$count" || fail "download" $?
+    # c) install (sleep/shutdown/lid blocked until done)
+    progress "Installing updates · 0%" "$(bar 0)  Preparing…" 0
+    phase_install "$count" || fail "install" $?
+
+    set_state last-success "$now"
+    rm -f "$STATE_DIR/last-failure" "$STATE_DIR/notified-fail" "$STATE_DIR/notified-held"
+    local msgs=()
+
+    # 7. Post-upgrade checks.
+    if [[ ! -d $running_kernel_dir ]]; then
+        msgs+=("Kernel updated — reboot when convenient.")
+    fi
+    local pacnew
+    pacnew=$(find /etc -xdev \( -name '*.pacnew' -o -name '*.pacsave' \) -newer "$stamp" 2>/dev/null)
+    rm -f "$stamp"
+    if [[ -n $pacnew ]]; then
+        msgs+=("New config files to merge: $(echo "$pacnew" | tr '\n' ' ')— run: sudo pacdiff")
+        log "new .pacnew/.pacsave: $pacnew"
+    fi
+
+    # Keep the package cache from eating the disk (last 3 versions kept).
+    if [[ -f /usr/lib/systemd/system/paccache.timer ]] && ! systemctl -q is-enabled paccache.timer 2>/dev/null; then
+        systemctl enable --now paccache.timer >>"$LOG" 2>&1 && log "enabled paccache.timer"
+    fi
+
+    update_flatpak
+
+    local mins=$(((SECONDS - started + 59) / 60))
+    log "done: $count package(s) upgraded in ${mins} min"
+    set_state last-result "ok: upgraded $count package(s) in ${mins} min"
+    local body="$count packages · $size_txt · ${mins} min"
+    ((${#msgs[@]})) && body+="\n$(printf '%s\n' "${msgs[@]}")"
+    progress "System updated ✓" "$body" 100 normal 15000
+    rm -f "$STATE_DIR/progress"
+}
+
+# ---- other subcommands -----------------------------------------------------
+fmt_time() { [[ -n ${1:-} ]] && date -d "@$1" '+%a %d %b %H:%M' || echo "never"; }
+
+cmd_status() {
+    echo "Auto-update status"
+    echo "  timer:         $(systemctl is-enabled auto-update.timer 2>/dev/null) / $(systemctl is-active auto-update.timer 2>/dev/null)"
+    [[ -f $STATE_DIR/paused ]] && echo "  PAUSED manually (sudo auto-update resume)"
+    echo "  last success:  $(fmt_time "$(get_state last-success)")"
+    echo "  last attempt:  $(fmt_time "$(get_state last-attempt)")"
+    echo "  last result:   $(get_state last-result)"
+    local pr; pr=$(get_state progress)
+    if [[ -n $pr ]] && systemctl -q is-active auto-update.service 2>/dev/null; then
+        echo "  RUNNING NOW:   $pr"
+    fi
+    local le; le=$(get_state last-error)
+    [[ -n $le ]] && echo "  last error:    $le"
+    local np; np=$(get_state news-pending)
+    [[ -n $np ]] && echo "  ARCH NEWS:     \"$np\" → read it, then: sudo auto-update ack"
+    if [[ -d /usr/lib/modules/$(uname -r) ]]; then :; else echo "  REBOOT:        kernel was updated, reboot when convenient"; fi
+    local pn; pn=$(find /etc -xdev -name '*.pacnew' 2>/dev/null)
+    [[ -n $pn ]] && echo "  .pacnew files: $(echo "$pn" | wc -l) (merge with: sudo pacdiff)"
+    local aur; aur=$(pacman -Qmq 2>/dev/null | wc -l)
+    echo "  AUR/foreign:   $aur package(s) — never auto-updated; update with yay/paru when you like"
+    echo "  next check:    $(systemctl list-timers auto-update.timer --no-legend 2>/dev/null | awk '{print $1, $2, $3, $4}')"
+}
+
+cmd_ack() {
+    need_root ack
+    local news
+    news=$(latest_news) || { echo "Couldn't reach archlinux.org right now."; exit 1; }
+    set_state news-acked "${news%%$'\t'*}"
+    rm -f "$STATE_DIR/news-pending" "$STATE_DIR/notified-news"
+    echo "Acknowledged: \"${news#*$'\t'}\" — auto-updates will resume on the next check."
+}
+
+mkdir -p "$STATE_DIR" 2>/dev/null || true
+case ${1:-status} in
+run) shift; cmd_run "$@" ;;
+status) cmd_status ;;
+log) tail -n "${2:-60}" "$LOG" ;;
+ack) cmd_ack ;;
+pause) need_root pause; touch "$STATE_DIR/paused"; echo "Automatic upgrades paused." ;;
+resume) need_root resume; rm -f "$STATE_DIR/paused"; echo "Automatic upgrades resumed." ;;
+*) sed -n '2,12p' "$0"; exit 1 ;;
+esac

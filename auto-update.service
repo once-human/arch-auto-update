@@ -1,0 +1,19 @@
+[Unit]
+Description=Safe automatic Arch Linux updates
+Documentation=file:///usr/local/share/doc/auto-update/README.md
+Wants=network-online.target
+After=network-online.target
+# Laptop: never start an upgrade on battery.
+ConditionACPower=true
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/auto-update run --scheduled
+# Run at the lowest priority so you never feel it while working.
+Nice=19
+CPUSchedulingPolicy=idle
+IOSchedulingClass=idle
+TimeoutStartSec=2h
+# If the system is going down mid-upgrade, give pacman time to finish.
+TimeoutStopSec=20min
+KillSignal=SIGINT
